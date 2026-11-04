@@ -1,0 +1,86 @@
+# Hand gesture control: gesture -> action mapping and tuning.
+#
+# A binding is either
+#   key:  <name>            one key: a pynput Key name (media_next, right, f5, ...) or one character
+#   keys: [cmd, shift, p]   a key combo, pressed in order, released in reverse
+#   command: <name>         a built-in command: toggle_dry_run | screenshot | open_spotify
+# plus a `label` (shown on screen) and optional `repeat: true` (fires again while held).
+# In a mode, `gesture: null` disables a global binding for that mode.
+
+default_mode: media
+
+# Bindings active in every mode (a mode can override or disable them).
+global:
+  rock:    {command: toggle_dry_run, label: "Toggle dry-run"}
+  ok:      {command: screenshot,     label: "Screenshot"}
+  call_me: {command: open_spotify,   label: "Open Spotify"}
+
+modes:
+  media:
+    open_palm:   {key: media_play_pause,  label: "Play / Pause"}
+    fist:        {key: media_volume_mute, label: "Mute"}
+    thumbs_up:   {key: media_volume_up,   label: "Volume +", repeat: true}
+    thumbs_down: {key: media_volume_down, label: "Volume -", repeat: true}
+    peace:       {key: media_next,        label: "Next track"}
+    pointing:    {key: media_previous,    label: "Previous track"}
+    swipe_right: {key: media_next,        label: "Next track"}       # gesture/motion.py
+    swipe_left:  {key: media_previous,    label: "Previous track"}
+
+  slides:
+    peace:     {key: right, label: "Next slide"}
+    pointing:  {key: left,  label: "Previous slide"}
+    open_palm: {key: f5,    label: "Start presentation"}
+    swipe_right: {key: right, label: "Next slide"}
+    swipe_left:  {key: left,  label: "Previous slide"}
+
+  mouse: {}  # cursor / click / drag / scroll come from gesture/motion.py (see `mouse:` below)
+
+cooldowns:
+  action: 1.0           # seconds between two different actions
+  repeat_interval: 0.35 # seconds between repeats of a held `repeat: true` gesture
+
+smoothing:
+  window: 7             # frames in the majority vote
+  min_ratio: 0.6        # fraction of the window that must agree (finger hysteresis does the rest)
+
+pinch:
+  ok_ratio: 0.25        # 👌 thumb tip–index tip distance < ok_ratio × palm size
+  click_ratio: 0.30     # mouse mode: pinch closer than this × palm size = left button down
+  release_factor: 1.4   # ...and released once it opens past click_ratio × this (hysteresis)
+
+swipe:                  # open-palm swipe left/right (palm centre trajectory)
+  window: 0.4           # seconds of history examined
+  min_travel: 0.25      # horizontal travel, fraction of the frame width
+  max_vertical_ratio: 0.5  # vertical spread must stay below this × horizontal travel
+  cooldown: 1.0         # seconds between swipes
+  still_hold: 0.3       # a static ✋ action only fires after the palm is still this long
+  still_eps: 0.04       # "still" = palm moved less than this (fraction of frame)
+
+volume:                 # pinch slider: thumb + index only, other fingers curled
+  modes: [media]
+  min_ratio: 0.25       # pinch distance (× palm size) that means 0 %
+  max_ratio: 1.10       # ...and 100 %
+  step: 3               # only send a new volume when it changes by at least this much
+  alpha: 0.4            # smoothing (EMA weight of the newest reading)
+
+mouse:
+  alpha: 0.35           # cursor EMA weight of the newest position (1 = raw, lower = smoother)
+  box: 0.6              # the centre 60 % of the frame maps onto the full screen
+  click_debounce: 0.3   # seconds after a release before a new press is accepted
+  click_freeze: 0.15    # cursor holds still this long after a press so clicks land on target
+  scroll_gain: 25       # scroll steps per frame-height of vertical hand movement (✌️)
+
+exit:
+  hold: 1.0             # both hands open palm for this long = quit
+
+ml:                     # demo.py --classifier ml
+  model: models/gesture_model.joblib
+  min_confidence: 0.6   # below this max probability the pose is "unknown"
+
+commands:
+  screenshot:
+    dir: ~/Desktop
+    prefix: gesture_
+  spotify:
+    app: Spotify
+    fallback_url: https://music.youtube.com
