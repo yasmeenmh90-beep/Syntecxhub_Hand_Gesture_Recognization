@@ -48,7 +48,13 @@ The angle is what makes sideways hands work. A finger pointing sideways is still
 
 - **Hysteresis:** becoming extended and becoming curled need different evidence. An ambiguous finger keeps its state from the last frame, so a slightly bent ring finger doesn't make ✌️ flicker.
 - **No history** (e.g. a single test frame): an ambiguous finger is resolved both ways, and the pose is only named if both give the same gesture. Otherwise it's `unknown`.
-- **Fist safety:** ✊ needs all four fingers *clearly* curled, so an unclear hand never fires Mute.
+- **Fist safety:** ✊ needs all four fingers *clearly* curled *and* a tucked thumb (near the wrist, pointing back toward the palm, or resting on the fingers), so an unclear hand never fires Mute.
+- **Thumbs up / down** have their own tests, measured on real photos:
+  - **direction:** the thumb's angle from vertical (thumb MCP → tip). It enters within **50°** and stays until **70°** (hysteresis), so a tilted thumb doesn't drop out.
+  - **fingers:** each curled, or half-bent but short (a loose fist). None may be clearly extended.
+  - **thumb:** it has to stick clearly out of the fist; a slight bend is fine.
+  - **hold-through:** a confirmed thumbs pose survives up to **0.3 s** of unknown frames, so the volume repeat keeps going. Any other confirmed gesture ends it immediately.
+  - Thumbs poses never start pinch mode and never read as fist or call me.
 - **Aspect ratio:** MediaPipe normalises x by the frame *width* and y by its *height*. Classification therefore uses `Hand.iso`, with x and z scaled by width/height, so angles and distances are true to the image.
 
 ### What you see on your hand
@@ -336,7 +342,7 @@ python tools/make_gif.py demo.mp4 --start 2 --duration 12   # trim
 python -m pytest -q
 ```
 
-177 tests, mostly on synthetic landmarks, trajectories and video, so they need no webcam, model, mouse or speakers. They cover:
+225 tests, mostly on synthetic landmarks, trajectories and video, so they need no webcam, model, mouse or speakers. They cover:
 - every gesture, including rock, OK and call me, on both hands and at ±25° rotation
 - the look-alike pairs (rock / call me / pointing, OK / open palm), and 🤘 horns as rock
 - the live display helpers (`tests/test_display.py`):
@@ -358,6 +364,13 @@ python -m pytest -q
   - skip (keeps partial rows), redo (discards only the current gesture's rows), pause (freezes countdown and recording), quit (saves the partial gesture)
   - 5 takes per gesture, mirror-augment counting, and the summary table
   - valid CSV rows end to end
+- thumbs (`tests/test_thumbs.py`):
+  - real and synthetic thumbs tilted to ±40° (whole hand and thumb only) stay thumbs
+  - the 50°/70° hysteresis
+  - a loose fist with the thumb out, and a bent thumb
+  - hold-through bridges dropouts so the volume repeat isn't interrupted (and without it, the repeat stalls)
+  - an up→down switch flips cleanly with no Mute
+  - thumbs never read as pinch, fist or call me
 - live-testing regressions (`tests/test_classifier_v2.py`):
   - an open palm with a real-proportioned spread thumb (was `unknown`)
   - a sideways pointing finger (was `fist`)
@@ -414,6 +427,7 @@ config.yaml              gesture → action mappings per mode, cooldowns, thresh
 tests/test_gestures.py   static gestures, config, modes, actions
 tests/test_motion.py     swipes, volume mapping, mouse mapping/smoothing, exit hold
 tests/test_classifier_v2.py  live-testing regressions (thumb, sideways, hysteresis, horns)
+tests/test_thumbs.py     thumbs direction hysteresis, loose fist, hold-through, up/down flip
 tests/test_pinch_mode.py pinch mode gating, volume mapping, debounce / exit grace
 tests/test_display.py    colour mapping, hold-ring progress, tag smoothing
 tests/test_guided.py     guided collection: order, skip, redo, pause, rate limit

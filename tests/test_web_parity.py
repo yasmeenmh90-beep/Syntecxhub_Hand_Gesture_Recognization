@@ -5,6 +5,7 @@ mirror x rotation, pinches, plus random jitter) and on random smoother / dispatc
 sequences. Needs Node.js; skipped when `node` isn't installed.
 """
 import itertools
+import math
 import json
 import os
 import random
@@ -18,7 +19,7 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.dirname(__file__))
 from gesture import ActionDispatcher, GestureSmoother, classify  # noqa: E402
-from gesture.classifier import PoseTracker, explain  # noqa: E402
+from gesture.classifier import HoldThrough, PoseTracker, explain, thumbs_pose  # noqa: E402
 from test_gestures import FINGER_X, make_hand  # noqa: E402
 
 NODE = shutil.which("node")
@@ -27,11 +28,14 @@ JS_MODULE = "file://" + os.path.join(ROOT, "web", "classifier.js")
 
 NODE_SCRIPT = """
 import { readFileSync } from "node:fs";
-const { classify, explain, PoseTracker, GestureSmoother, ActionDispatcher } = await import(process.argv[2]);
+const { classify, explain, PoseTracker, GestureSmoother, ActionDispatcher, HoldThrough, thumbsPose } =
+  await import(process.argv[2]);
 const data = JSON.parse(readFileSync(process.argv[3], "utf8"));
 const out = { gestures: data.hands.map((h) => classify(h)),
               tri: data.hands.map((h) => explain(h).tri) };
 out.tracked = data.tracks.map((seq) => { const t = new PoseTracker(); return seq.map((h) => t.update(h).label); });
+out.thumbsPose = data.hands.map((h) => thumbsPose(h));
+out.held = data.holds.map((seq) => { const h = new HoldThrough(); return seq.map(([t, g]) => h.update(t, g)); });
 out.smoother = data.sequences.map((seq) => {
   const s = new GestureSmoother(7, 0.7);
   return seq.map((g) => [s.update(g), Math.round(s.confidence * 1e6) / 1e6]);
@@ -106,7 +110,31 @@ def test_js_matches_python(tmp_path):
                          pa[1] + (pb[1] - pa[1]) * t + rng.gauss(0, 0.004), 0.0) for pa, pb in zip(a, b)])
         tracks.append(seq)
 
-    js = run_node({"hands": hands, "sequences": sequences, "dispatch": dispatch, "tracks": tracks}, tmp_path)
+    # thumbs: real thumbs hands tilted -60..60 (whole hand and thumb only) + loose fists, as
+    # jittered tracker sequences, so the 50/70 degree hysteresis path is compared too
+    sys.path.insert(0, os.path.dirname(__file__))
+    from test_thumbs import aim_thumb, loose_fist, real_thumbs, thumbs as thumbs_hand
+    thumb_bases = [lm for _, lm in real_thumbs()] + [loose_fist(thumbs_hand(d)) for d in ("up", "down")]
+    for base in thumb_bases:
+        for whole in (True, False):
+            seq = []
+            for k in range(60):
+                deg = 60 * math.sin(k / 60 * 2 * math.pi)
+                h = aim_thumb(base, deg, whole) if base in [lm for _, lm in real_thumbs()] else base
+                seq.append([(x + rng.gauss(0, 0.004), y + rng.gauss(0, 0.004), z + rng.gauss(0, 0.004))
+                            for x, y, z in h])
+            tracks.append(seq)
+            hands.extend(seq[::6])
+    holds = []
+    for _ in range(40):
+        t, seq = 0.0, []
+        for _ in range(40):
+            t += rng.choice((0.03, 0.05, 0.1, 0.2, 0.35))
+            seq.append([round(t, 3), rng.choice(["thumbs_up", "thumbs_down", "unknown", "unknown", "fist", "peace"])])
+        holds.append(seq)
+
+    js = run_node({"hands": hands, "sequences": sequences, "dispatch": dispatch, "tracks": tracks,
+                   "holds": holds}, tmp_path)
 
     py = [classify(h) for h in hands]
     mismatches = [(i, p, j) for i, (p, j) in enumerate(zip(py, js["gestures"])) if p != j]
@@ -120,6 +148,10 @@ def test_js_matches_python(tmp_path):
     for seq, js_seq in zip(tracks, js["tracked"]):
         tracker = PoseTracker()
         assert [tracker.update(h).label for h in seq] == js_seq
+    assert [thumbs_pose(h) for h in hands] == js["thumbsPose"]
+    for seq, js_seq in zip(holds, js["held"]):
+        hold = HoldThrough()
+        assert [hold.update(t, g) for t, g in seq] == js_seq
 
     for seq, js_seq in zip(sequences, js["smoother"]):
         s = GestureSmoother(7, 0.7)

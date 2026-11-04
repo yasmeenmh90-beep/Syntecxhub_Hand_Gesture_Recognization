@@ -24,7 +24,7 @@ import numpy as np
 
 from gesture import ActionDispatcher, GestureSmoother, load_config
 from gesture import motion
-from gesture.classifier import PoseTracker
+from gesture.classifier import HoldThrough, PoseTracker
 from gesture.config import setting
 from gesture.debug import DEFAULT_FIXTURES, append_fixture, debug_lines, state_string
 from gesture.features import KEY_LABELS
@@ -984,6 +984,7 @@ def run(args):
                                  step=vol_cfg.get("step", 3), alpha=vol_cfg.get("alpha", 0.4))
     volume_modes = set(vol_cfg.get("modes", ["media"]))
     pinch_ctl = motion.PinchController(slider)
+    hold = HoldThrough(grace=0.3)  # thumbs up/down survive 0.3 s of unknown frames (volume repeat)
     screen_w, screen_h = motion.screen_size()
     mouse_box = float(m_cfg.get("box", 0.6))
     mouse_logic = motion.MouseLogic(
@@ -1048,9 +1049,11 @@ def run(args):
                 pinch = pinch_ctl.update(now, iso, infos[0].states, enabled=dispatcher.mode in volume_modes)
                 if pinch.ended:  # the L-shape voted "pointing" all along: don't let it fire on exit
                     smoother.reset()
-                stable = smoother.update(raw)
+                    hold.reset()
+                stable = hold.update(now, smoother.update(raw))
             else:
                 smoother.reset()
+                hold.reset()
                 swipe.reset()
                 pinch_ctl.reset()
                 mouse_events += mouse_logic.reset()
@@ -1233,6 +1236,7 @@ def run(args):
                 swipe.reset()
                 if pinch_ctl.reset():
                     smoother.reset()
+                hold.reset()
                 print(f"[mode] {dispatcher.cycle_mode()}")
             if key == ord("h"):
                 show_help = not show_help

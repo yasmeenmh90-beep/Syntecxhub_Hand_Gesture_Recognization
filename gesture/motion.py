@@ -17,7 +17,7 @@ import sys
 from collections import deque
 from dataclasses import dataclass, field
 
-from .classifier import MIDDLE_MCP, THUMB_TIP, WRIST, finger_metrics, finger_states
+from .classifier import MIDDLE_MCP, THUMB_TIP, WRIST, finger_metrics, finger_states, thumbs_pose
 
 INDEX_TIP, MIDDLE_TIP = 8, 12
 PALM_IDX = (0, 5, 9, 13, 17)
@@ -135,6 +135,8 @@ def is_pinch_pose(lm, states=None, thumb_near: float = 0.45, min_index_reach: fl
     """
     s = states or finger_states(lm)
     if s["middle"] or s["ring"] or s["pinky"] or index_reach(lm) < min_index_reach:
+        return False
+    if thumbs_pose(lm):  # a (loose-fist) thumbs up/down must never start pinch-volume mode
         return False
     return pinch_ratio(lm) < thumb_near or finger_metrics(lm)["thumb_away"] >= 1.0
 

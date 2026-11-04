@@ -3,7 +3,7 @@
 // gesture/classifier.py) names the gesture, and gestures drive a demo <audio> player,
 // since a web page can't press OS media keys.
 import { FilesetResolver, HandLandmarker } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.1.1/vision_bundle.mjs";
-import { ActionDispatcher, GestureSmoother, PoseTracker, toIsotropic } from "./classifier.js";
+import { ActionDispatcher, GestureSmoother, HoldThrough, PoseTracker, toIsotropic } from "./classifier.js";
 
 const WASM_URL = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.1.1/wasm";
 const MODEL_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
@@ -258,6 +258,7 @@ function showToast(text) {
 // ------------------------------------------------------------------ main loop
 let landmarker, player;
 const smoother = new GestureSmoother(7, 0.6);
+const hold = new HoldThrough(); // thumbs up/down survive 0.3 s of unknown frames (volume repeat)
 const poseTrackers = new Map(); // per hand (by handedness): finger-state hysteresis
 const dispatcher = new ActionDispatcher(BINDINGS, { cooldown: 1.0, repeatInterval: 0.35 });
 let lastVideoTime = -1, hands = [], raw = "no hand", stable = "unknown";
@@ -290,9 +291,10 @@ function frame(now) {
 
       if (hands.length) {
         raw = labels[0];
-        stable = smoother.update(raw);
+        stable = hold.update(now / 1000, smoother.update(raw));
       } else {
         smoother.reset();
+        hold.reset();
         raw = "no hand"; stable = "unknown";
       }
       const fired = dispatcher.update(stable, now / 1000);
