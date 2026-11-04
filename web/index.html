@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Hand Gesture Control</title>
+  <meta name="description" content="Real-time hand gesture recognition in the browser with MediaPipe. Control a demo music player with your hand. Video never leaves your device.">
+  <meta name="theme-color" content="#140a1e">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%E2%9C%8B%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main id="stage" aria-label="Webcam view with gesture overlays">
+    <video id="video" playsinline muted></video>
+    <canvas id="canvas" aria-hidden="true"></canvas>
+
+    <!-- top-left: current gesture -->
+    <section id="hud" class="glass" aria-live="polite" hidden>
+      <div class="hud-title"><span id="hud-icon">🫥</span> <span id="hud-name">No hand</span></div>
+      <div id="hud-action" class="muted">Waiting for a hand</div>
+      <div class="conf-row">
+        <span class="caps muted">Confidence</span>
+        <span id="hud-raw" class="muted small">raw: –</span>
+      </div>
+      <div class="bar" role="meter" aria-label="Smoother agreement" aria-valuemin="0" aria-valuemax="100">
+        <div id="conf-fill" class="bar-fill"></div>
+        <div class="bar-tick" style="left:60%" title="60% of frames must agree"></div>
+      </div>
+    </section>
+
+    <!-- top-right: status badges -->
+    <div id="pills" hidden>
+      <span class="pill pink" id="fps">– FPS</span>
+      <span class="pill lavender">📐 RULES</span>
+      <span class="pill pink">🎧 MEDIA</span>
+      <span class="pill green"><i class="dot"></i>IN-BROWSER</span>
+      <button id="legend-btn" class="pill lavender pill-btn" aria-expanded="false" aria-controls="legend" hidden>? Gestures</button>
+    </div>
+
+    <!-- top-centre: action toast -->
+    <div id="toast" class="glass" role="status" aria-live="assertive">
+      <div class="caps pink-text">Action</div>
+      <div id="toast-text" class="toast-text"></div>
+    </div>
+
+    <!-- centre: no-hand hint -->
+    <div id="hint" class="glass pill-shape" hidden>Show your hand ✋</div>
+
+    <!-- bottom-left: legend -->
+    <section id="legend" class="glass" hidden>
+      <div class="caps muted">Gestures</div>
+      <ul id="legend-rows"></ul>
+      <div class="muted small foot">🤟/🤘 rock, 👌 and 🤙 are recognised but only act in the desktop app · <kbd>h</kbd> hide</div>
+    </section>
+
+    <!-- bottom-right: demo player -->
+    <section id="player" class="glass" aria-label="Demo music player" hidden>
+      <div class="caps muted">Now playing <span id="track-no" class="small"></span></div>
+      <div id="track-title" class="track-title">–</div>
+      <div class="bar thin"><div id="progress" class="bar-fill"></div></div>
+      <div class="player-row">
+        <button id="btn-prev" aria-label="Previous track">⏮</button>
+        <button id="btn-play" aria-label="Play or pause">▶</button>
+        <button id="btn-next" aria-label="Next track">⏭</button>
+        <span id="vol-icon" aria-hidden="true">🔊</span>
+        <div class="bar vol" role="meter" aria-label="Volume" aria-valuemin="0" aria-valuemax="100">
+          <div id="vol-fill" class="bar-fill"></div>
+        </div>
+        <span id="vol-text" class="small">70%</span>
+      </div>
+      <audio id="audio" preload="auto"></audio>
+    </section>
+
+    <!-- start / error screen -->
+    <section id="start" class="glass start-card">
+      <h1>✋ Hand Gesture Control</h1>
+      <p>Control a little music player with your hand, right in the browser.</p>
+      <ul class="start-list">
+        <li>✋ play / pause · ✊ mute · 👍 👎 volume</li>
+        <li>✌️ next track · ☝️ previous track</li>
+      </ul>
+      <button id="start-btn" class="primary">Start camera</button>
+      <p id="start-status" class="muted small" role="status"></p>
+      <p class="muted small">Runs locally with MediaPipe: your video never leaves this device.
+        The music is generated tones, made in your browser.</p>
+    </section>
+  </main>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
