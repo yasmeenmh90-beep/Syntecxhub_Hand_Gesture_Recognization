@@ -17,7 +17,7 @@ import sys
 from collections import deque
 from dataclasses import dataclass, field
 
-from .classifier import MIDDLE_MCP, THUMB_TIP, WRIST, finger_states
+from .classifier import MIDDLE_MCP, THUMB_TIP, WRIST, finger_metrics, finger_states
 
 INDEX_TIP, MIDDLE_TIP = 8, 12
 PALM_IDX = (0, 5, 9, 13, 17)
@@ -125,14 +125,18 @@ def index_reach(lm) -> float:
     return _dist(lm[WRIST], lm[INDEX_TIP]) / palm_size(lm)
 
 
-def is_pinch_pose(lm, states=None, thumb_near: float = 0.45) -> bool:
-    """Thumb + index only: middle/ring/pinky curled, index extended, and the thumb either
-    extended or near the index tip. A plain pointing hand (thumb tucked, far from the
-    index tip) is *not* a pinch pose."""
+def is_pinch_pose(lm, states=None, thumb_near: float = 0.45, min_index_reach: float = 0.9) -> bool:
+    """Thumb + index only: middle/ring/pinky curled, the index not folded into the palm,
+    and the thumb either pointing away from the palm or near the index tip.
+
+    Robust across the whole gap: when the tips touch, the index bends and the thumb reads
+    as tucked; half-open, the thumb is between states. A plain pointing hand (thumb tucked
+    toward the pinky, far from the index tip) and a fist are *not* a pinch pose.
+    """
     s = states or finger_states(lm)
-    if s["middle"] or s["ring"] or s["pinky"] or not s["index"]:
+    if s["middle"] or s["ring"] or s["pinky"] or index_reach(lm) < min_index_reach:
         return False
-    return s["thumb"] or pinch_ratio(lm) < thumb_near
+    return pinch_ratio(lm) < thumb_near or finger_metrics(lm)["thumb_away"] >= 1.0
 
 
 class VolumeSlider:
@@ -159,6 +163,63 @@ class VolumeSlider:
             self.sent = v
             return v
         return None
+
+
+@dataclass
+class PinchState:
+    active: bool = False    # pinch mode on: volume follows the gap, HUD/tag show "Pinch"
+    gating: bool = False    # block every static action this frame (on from the first pinch frame)
+    level: int | None = None  # smoothed volume 0-100 while active
+    send: int | None = None   # value to send to the OS this frame (changed by >= step), if any
+    ended: bool = False     # pinch mode just ended: the caller resets the gesture smoother
+
+
+class PinchController:
+    """Pinch-volume mode with debounced start, a short exit grace, and clean hand-off.
+
+    - Static actions are gated from the very first pinch-pose frame.
+    - The volume only follows the gap after `enter_frames` consecutive pinch frames, so a
+      one-frame misread can't jump it.
+    - Mode stays on for `exit_grace` s after the last pinch frame (brief misreads).
+    - On exit `ended` is set: the caller clears the smoother so the L-shape's leftover
+      "pointing" vote can't fire Previous track the instant the pinch ends.
+    """
+
+    def __init__(self, slider: "VolumeSlider", enter_frames: int = 2, exit_grace: float = 0.3):
+        self.slider = slider
+        self.enter_frames, self.exit_grace = enter_frames, exit_grace
+        self.active = False
+        self._streak = 0
+        self._last_pose_t = float("-inf")
+
+    def reset(self) -> bool:
+        """Hand lost / mode switch. Returns True if pinch mode was active."""
+        was = self.active
+        self.active, self._streak = False, 0
+        self.slider.reset()
+        return was
+
+    def update(self, t: float, iso, states=None, enabled: bool = True) -> PinchState:
+        pose = bool(enabled and iso is not None and is_pinch_pose(iso, states))
+        out = PinchState()
+        if pose:
+            self._streak += 1
+            self._last_pose_t = t
+            if self._streak >= self.enter_frames:
+                self.active = True
+        else:
+            self._streak = 0
+            if self.active and (not enabled or t - self._last_pose_t > self.exit_grace):
+                self.active = False
+                out.ended = True
+                self.slider.reset()
+        out.active = self.active
+        out.gating = self.active or pose
+        if self.active and pose:
+            out.send = self.slider.update(pinch_ratio(iso))
+        if self.active:
+            out.level = self.slider.level
+        return out
 
 
 # ------------------------------------------------------------------ virtual mouse

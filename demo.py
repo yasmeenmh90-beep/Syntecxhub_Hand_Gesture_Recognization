@@ -17,7 +17,7 @@ import argparse
 import math
 import os
 import time
-from collections import Counter, OrderedDict
+from collections import Counter, OrderedDict, deque
 
 import cv2
 import numpy as np
@@ -28,6 +28,7 @@ from gesture.classifier import PoseTracker
 from gesture.config import setting
 from gesture.debug import DEFAULT_FIXTURES, append_fixture, debug_lines, state_string
 from gesture.features import KEY_LABELS
+from gesture import display as D
 from gesture.hand_tracker import HandTracker, draw_hand, hand_box, lerp_color, palm_center, rounded_rect
 
 try:
@@ -50,7 +51,7 @@ HIGHLIGHT = (150, 60, 200)  # pink-tinted glass for the active legend row
 ICONS = {
     "open_palm": "✋", "fist": "✊", "thumbs_up": "👍", "thumbs_down": "👎",
     "peace": "✌️", "pointing": "☝️", "rock": "🤟", "ok": "👌", "call_me": "🤙",
-    "swipe_right": "👉", "swipe_left": "👈", "unknown": "🤔", "no hand": "🫥",
+    "swipe_right": "👉", "swipe_left": "👈", "pinch": "🤏", "unknown": "🤔", "no hand": "🫥",
 }
 LEGEND_NAMES = {"rock": "🤟/🤘 Rock (thumb out or in)"}  # legend wording where it differs
 MODE_STYLE = {"media": ("🎧", PINK), "slides": ("🖥️", PURPLE), "mouse": ("🖱️", (212, 182, 45))}
@@ -254,15 +255,17 @@ class TextRenderer:
 
 
 def blit(img, spr, x, y, alpha=1.0):
+    """Alpha-blend a BGRA sprite into img (cv2.blendLinear: ~6x faster than numpy floats)."""
     h, w = img.shape[:2]
     sh, sw = spr.shape[:2]
+    x, y = int(x), int(y)
     x1, y1, x2, y2 = max(x, 0), max(y, 0), min(x + sw, w), min(y + sh, h)
     if x2 <= x1 or y2 <= y1 or alpha <= 0:
         return
     s = spr[y1 - y:y2 - y, x1 - x:x2 - x]
     roi = img[y1:y2, x1:x2]
-    a = s[..., 3:4].astype(np.float32) * (alpha / 255.0)
-    roi[:] = (roi * (1.0 - a) + s[..., :3] * a).astype(np.uint8)
+    a = s[..., 3].astype(np.float32) * (alpha / 255.0)
+    roi[:] = cv2.blendLinear(np.ascontiguousarray(s[..., :3]), roi, a, 1.0 - a)
 
 
 def fade_blend(frame, rect, draw_fn, alpha):
@@ -315,11 +318,8 @@ class Card:
         return sw, sh
 
     def finalize(self):
-        a = self.opa.astype(np.float32)[..., None] / 255.0
-        self._a = a
-        self._colf = self.col.astype(np.float32)
-        self._premul = self._colf * a
-        self._inv = 1.0 - a
+        self._a = self.opa.astype(np.float32) / 255.0  # per-pixel weights for cv2.blendLinear
+        self._inv = 1.0 - self._a
         return self
 
     def blit(self, frame, x, y, alpha=1.0):
@@ -330,11 +330,14 @@ class Card:
             return
         sl = (slice(y1 - y, y2 - y), slice(x1 - x, x2 - x))
         roi = frame[y1:y2, x1:x2]
+        col = self.col if (x1 - x, y1 - y, x2 - x1, y2 - y1) == (0, 0, self.w, self.h) else \
+            np.ascontiguousarray(self.col[sl])
         if alpha >= 0.999:
-            roi[:] = (roi * self._inv[sl] + self._premul[sl]).astype(np.uint8)
+            a, inv = self._a[sl], self._inv[sl]
         else:
             a = self._a[sl] * alpha
-            roi[:] = (roi * (1.0 - a) + self._colf[sl] * a).astype(np.uint8)
+            inv = 1.0 - a
+        roi[:] = cv2.blendLinear(col, roi, np.ascontiguousarray(a), np.ascontiguousarray(inv))
 
 
 def _overlap(a, b) -> bool:
@@ -404,15 +407,16 @@ class UI:
     def render(self, frame, *, raw, stable, conf, fps, dry_run, show_help, hand_present,
                toast, now, bindings, mode, extra_rows=(), volume=None, pinch_pts=None,
                mouse_ui=None, exit_progress=0.0, classifier="RULES", hand_tags=(),
-               debug=None, prompt=None):
+               debug=None, prompt=None, hand_views=(), effects=None, recent_actions=(), hud_override=None):
         self.bindings = bindings
+        self.recent_actions = list(recent_actions)[:3]
         self.extra_rows = list(extra_rows)
         if mouse_ui is not None:
             self._mouse_box(frame, mouse_ui["box"])  # under the panels
         if debug:
             self._debug_dots(frame, debug.get("hands", ()))
 
-        occupied = [self._hud(frame, raw, stable, conf, hand_present)]
+        occupied = [self._hud(frame, raw, stable, conf, hand_present, hud_override)]
         occupied += self._pills(frame, fps, dry_run, mode, classifier)
         if show_help:
             occupied.append(self._legend(frame, stable))
@@ -428,6 +432,16 @@ class UI:
         if toast_rect:
             occupied.append(toast_rect)
         self._tags(frame, hand_tags, occupied)
+        if hand_views or effects:
+            # hand-anchored overlays never cover a panel: back up the panel areas and
+            # put them back afterwards (cheap: the panels are small)
+            panels = [r for r in occupied if r[2] > r[0] and r[3] > r[1]]
+            reach = self._hand_reach(hand_views, effects or {})  # where overlays can land
+            saved = [(r, frame[max(r[1], 0):r[3], max(r[0], 0):r[2]].copy())
+                     for r in panels if any(D.overlaps(r, z) for z in reach)]
+            self._hand_layer(frame, hand_views, effects or {}, panels, now)
+            for r, patch in saved:
+                frame[max(r[1], 0):r[3], max(r[0], 0):r[2]] = patch
 
         if mouse_ui is not None:
             self._mouse(frame, mouse_ui)
@@ -437,38 +451,58 @@ class UI:
             self._pulse(frame, toast, now)
 
     # -- panels (each returns its rect)
-    def _hud(self, frame, raw, stable, conf, hand_present):
+    def _hud(self, frame, raw, stable, conf, hand_present, override=None):
         """Compact top-left card: gesture, its action, confidence."""
         T, sz, px, pad = self.text, self.sz, self.px, self.pad
         g = stable if hand_present else "no hand"
         title = f"{ICONS.get(g, '')} {pretty(g)}"
-        if g in self.bindings:
+        if override:  # e.g. pinch mode: ("🤏 Pinch", "→  Volume 62%")
+            title, action, acolor = override[0], override[1], WHITE
+        elif g in self.bindings:
             action, acolor = f"→  {self.bindings[g].label}", WHITE
         elif hand_present:
             action, acolor = "Hold a gesture steady…", MUTED
         else:
             action, acolor = "Waiting for a hand", MUTED
-        raw_txt = f"raw: {raw.replace('_', ' ')}   {conf * 100:3.0f}%"
+        pct = f"{conf * 100:.0f}%" if hand_present else ""
+        chips = self.recent_actions  # newest first (raw label lives in the 'g' debug card)
         tw, th = T.measure(title, sz["title"], True)
         aw, ah = T.measure(action, sz["body"])
-        rw, sh = T.measure(raw_txt, sz["small"])
-        lw, _ = T.measure("CONF", sz["small"], True)
+        lw, sh = T.measure("CONFIDENCE", sz["small"], True)
+        chip_dims = [T.measure(c, sz["small"], True) for c in chips]
+        chip_h = (max(h for _, h in chip_dims) + px(6)) if chips else 0
+        chips_w = sum(w + px(14) for w, _ in chip_dims) + px(6) * max(0, len(chips) - 1)
         bar_h = px(6)
-        width = max(px(240), tw + 2 * pad, aw + 2 * pad, lw + rw + px(16) + 2 * pad)
+        width = max(px(240), tw + 2 * pad, aw + 2 * pad, lw + px(50) + 2 * pad, chips_w + 2 * pad)
+        width = min(width, int(self.w * 0.42))
         y_action = pad + th
         y_label = y_action + ah + px(8)
         y_bar = y_label + sh + px(5)
-        height = y_bar + bar_h + pad
+        y_chips = y_bar + bar_h + px(8)
+        height = (y_chips + chip_h + pad) if chips else (y_bar + bar_h + pad)
         x1 = y1 = self.margin
 
         def build():
             c = Card(width, height, self.radius)
             c.text(T, title, (pad, pad - px(2)), sz["title"], WHITE, bold=True)
             c.text(T, action, (pad, y_action), sz["body"], acolor)
-            c.text(T, "CONF", (pad, y_label), sz["small"], MUTED, bold=True)
-            c.text(T, raw_txt, (width - pad, y_label), sz["small"], MUTED, anchor="rt")
+            c.text(T, "CONFIDENCE", (pad, y_label), sz["small"], MUTED, bold=True)
+            if pct:
+                c.text(T, pct, (width - pad, y_label), sz["small"], MUTED, anchor="rt")
+            x = pad
+            for i, (chip, (cw, _)) in enumerate(zip(chips, chip_dims)):
+                w = cw + px(14)
+                if x + w > width - pad:
+                    break
+                col = WHITE if i == 0 else MUTED
+                c.shape(lambda im, cc, x=x, w=w: rounded_rect(im, (x, y_chips), (x + w, y_chips + chip_h), chip_h // 2,
+                                                              cc, -1), (70, 40, 70), 0.85)
+                c.shape(lambda im, cc, x=x, w=w: rounded_rect(im, (x, y_chips), (x + w, y_chips + chip_h), chip_h // 2,
+                                                              cc, self.border), PINK if i == 0 else TRACK)
+                c.text(T, chip, (x + px(7), y_chips + chip_h // 2), sz["small"], col, bold=i == 0, anchor="lm")
+                x += w + px(6)
             return c
-        self.card(("hud", title, action, acolor, raw_txt, width), build).blit(frame, x1, y1)
+        self.card(("hud", title, action, acolor, pct, tuple(chips), width), build).blit(frame, x1, y1)
         self.bar(frame, x1 + pad, y1 + y_bar, width - 2 * pad, bar_h, conf if hand_present else 0)
         return (x1, y1, x1 + width, y1 + height)
 
@@ -563,16 +597,16 @@ class UI:
         """Vertical volume bar on the right edge + a line between the pinching tips."""
         T, px, pad = self.text, self.px, self.pad
         bw, bh = px(14), int(self.h * 0.34)
-        _, lh = T.measure("100", self.sz["body"], True)
+        lw, lh = T.measure("100%", self.sz["body"], True)
         _, sh = T.measure("VOL", self.sz["small"], True)
-        pw = max(px(58), T.measure("🔊 VOL", self.sz["small"], True)[0] + 2 * px(10))
+        pw = max(px(58), lw + 2 * px(10), T.measure("🔊 VOL", self.sz["small"], True)[0] + 2 * px(10))
         ph = pad + lh + px(6) + bh + px(6) + sh + pad
         x1, y1 = self.w - self.margin - pw, self.h // 2 - ph // 2
         by1 = pad + lh + px(6)
 
         def build():
             c = Card(pw, ph, self.radius)
-            c.text(T, f"{level}", (pw // 2, pad), self.sz["body"], WHITE, bold=True, anchor="mt")
+            c.text(T, f"{level}%", (pw // 2, pad), self.sz["body"], WHITE, bold=True, anchor="mt")
             c.text(T, "🔊 VOL", (pw // 2, by1 + bh + px(6)), self.sz["small"], MUTED, bold=True, anchor="mt")
             c.shape(lambda im, cc: rounded_rect(im, (pw // 2 - bw // 2, by1), (pw // 2 + bw // 2, by1 + bh), bw // 2, cc, -1),
                     TRACK)
@@ -664,6 +698,159 @@ class UI:
                     occupied.append(rect)
                     break
 
+    # -- hand-anchored overlays (box, tag + hold ring, emoji pop, action pill, volume meter)
+    def _dashed_box(self, frame, box, color, th):
+        x1, y1, x2, y2 = box
+        dash = self.px(12)
+        segs = []
+        for x in range(x1, x2, dash * 2):
+            segs += [((x, y1), (min(x + dash, x2), y1)), ((x, y2), (min(x + dash, x2), y2))]
+        for y in range(y1, y2, dash * 2):
+            segs += [((x1, y), (x1, min(y + dash, y2))), ((x2, y), (x2, min(y + dash, y2)))]
+        cv2.polylines(frame, [np.array(sg, np.int32) for sg in segs], False, color, th, cv2.LINE_AA)
+
+    def _hand_reach(self, views, fx):
+        """Rects that hand overlays (box, tag, pop, pill, meter) could touch this frame."""
+        m = self.px(170)  # tag above/below + emoji pop + floating pill + meter
+        boxes = [v["box"] for v in views] + [e["box"] for k in ("pops", "floats") for e in fx.get(k, ())]
+        if fx.get("meter"):
+            boxes.append(fx["meter"]["box"])
+        return [(b[0] - m, b[1] - m, b[2] + m, b[3] + m) for b in boxes]
+
+    def _tag_card(self, text, color, unknown, emoji_slot):
+        """Tag pill (cached per text/colour). Leaves a round slot for the emoji + ring."""
+        T, px = self.text, self.px
+        size = self.sz["tag"]
+        tw, th = T.measure(text, size, True)
+        tag_h = th + px(12)
+        slot = tag_h if emoji_slot else 0
+        tag_w = slot + tw + px(22)
+
+        def build():
+            fill, alpha = ((60, 50, 60), 0.75) if unknown else (color, 0.95)
+            c = Card(tag_w, tag_h, tag_h // 2, fill=fill, alpha=alpha,
+                     border=(110, 100, 110) if unknown else None, border_px=self.border)
+            if slot:  # dark disc behind the emoji so the hold ring reads on any accent colour
+                c.shape(lambda im, cc: cv2.circle(im, (tag_h // 2, tag_h // 2), tag_h // 2 - px(2), cc, -1, cv2.LINE_AA),
+                        (45, 28, 45), 0.9)
+            c.text(T, text, (slot + px(11), tag_h // 2), size, MUTED if unknown else WHITE, bold=True, anchor="lm")
+            return c
+        return self.card(("tag2", text, color, unknown, emoji_slot), build)
+
+    def _emoji_sprite(self, emoji, size, scale_q=None):
+        """Emoji sprite at a size; scaled copies are cached per 5% step (no per-frame resize)."""
+        key = ("emoji", emoji, size, scale_q)
+        spr = self._cards.get(key)
+        if spr is None:
+            base = self.text.sprite(emoji, size, WHITE)
+            if scale_q is not None and scale_q != 20:
+                k = scale_q / 20
+                base = cv2.resize(base, (max(1, int(base.shape[1] * k)), max(1, int(base.shape[0] * k))),
+                                  interpolation=cv2.INTER_LINEAR)
+            spr = base
+            self._cards[key] = spr
+            if len(self._cards) > 160:
+                self._cards.popitem(last=False)
+        return spr
+
+    def _hand_layer(self, frame, views, fx, avoid, now):
+        T, px = self.text, self.px
+        th2 = max(1, round(2 * self.s))
+        for v in views:
+            box, col = v["box"], v["color"]
+            unknown = v["label"] in ("unknown", "no hand")
+            # ---- box: solid accent, or dashed grey when unknown
+            if unknown:
+                self._dashed_box(frame, box, col, th2)
+            else:
+                rounded_rect(frame, box[:2], box[2:], int(18 * self.s), col, th2)
+            # ---- tag: "…" when unknown, else emoji slot + name; follows the box smoothly
+            name = "…" if unknown else pretty(v["label"]) + v.get("suffix", "")
+            card = self._tag_card(name, col, unknown, emoji_slot=not unknown)
+            target = D.place_tag(box, card.w, card.h, self.w, self.h, avoid, gap=px(6))
+            if target is None:
+                continue
+            tx, ty = v["tag_smoother"].update(target)
+            tx, ty, _, _ = D.clamp_rect((tx, ty, tx + card.w, ty + card.h), self.w, self.h)
+            card.blit(frame, tx, ty)
+            if unknown:
+                continue
+            # emoji inside the round slot, with the hold-to-fire ring around it
+            r = card.h // 2
+            cx, cy = tx + r, ty + r
+            spr = self._emoji_sprite(ICONS.get(v["label"], "✨"), max(10, int(card.h * 0.6)))
+            blit(frame, spr, cx - spr.shape[1] // 2, cy - spr.shape[0] // 2)
+            prog = v.get("progress")
+            if prog is not None:
+                flash = D.flash_curve(now - v.get("flash_t", -1e9))
+                k, white = flash if flash else (1.0, 0.0)
+                rr = int((r - px(1)) * k)
+                ring_w = max(2, round(3 * self.s * (1 + white)))
+                cv2.circle(frame, (cx, cy), rr, D.lerp_color(col, (40, 30, 40), 0.55), ring_w, cv2.LINE_AA)
+                if prog > 0:
+                    ring_col = D.lerp_color(WHITE, col, 0.0 if v.get("confirmed") else 0.35)
+                    cv2.ellipse(frame, (cx, cy), (rr, rr), -90, 0, 360 * prog, ring_col, ring_w, cv2.LINE_AA)
+                if flash:  # bright pop ring when the action fires
+                    cv2.circle(frame, (cx, cy), int(rr * (1 + 0.5 * (1 - white))), D.lerp_color(col, WHITE, white),
+                               max(1, round(2 * self.s)), cv2.LINE_AA)
+
+        # ---- big emoji pop when a new gesture is confirmed
+        for p in fx.get("pops", ()):
+            curve = D.pop_curve(now - p["t0"])
+            if not curve:
+                continue
+            scale, alpha = curve
+            spr = self._emoji_sprite(p["emoji"], max(20, round(120 * self.s)), round(scale * 20))
+            bx1, by1, bx2, by2 = p["box"]  # above the box's top-right corner (meter sits at the side)
+            x = min(max(bx2 - spr.shape[1] // 2, 0), self.w - spr.shape[1])
+            y = max(by1 - spr.shape[0] - px(4), 0)
+            blit(frame, spr, x, y, alpha)
+
+        # ---- action pill floating up from the hand
+        for fl in fx.get("floats", ()):
+            curve = D.float_curve(now - fl["t0"])
+            if not curve:
+                continue
+            rise, alpha = curve
+            label = fl["text"]
+
+            def build(label=label, color=fl["color"]):
+                tw, th = T.measure(label, self.sz["pill"], True)
+                c = Card(tw + px(22), th + px(10), (th + px(10)) // 2, alpha=0.85, border=color, border_px=th2)
+                c.text(T, label, (c.w // 2, c.h // 2), self.sz["pill"], WHITE, bold=True, anchor="mm")
+                return c
+            card = self.card(("float", label, fl["color"]), build)
+            bx1, by1, bx2, _ = fl["box"]
+            x = (bx1 + bx2) // 2 - card.w // 2
+            y = by1 - card.h - px(10) - int(px(70) * rise)
+            x, y, _, _ = D.clamp_rect((x, y, x + card.w, y + card.h), self.w, self.h)
+            card.blit(frame, x, y, alpha)
+
+        # ---- volume meter next to the hand while thumbs up/down repeats
+        m = fx.get("meter")
+        if m:
+            bx1, by1, bx2, by2 = m["box"]
+            mw, mh = px(12), max(px(60), min(px(120), by2 - by1))
+            x = bx2 + px(10)
+            if x + mw + px(40) > self.w:
+                x = bx1 - px(10) - mw
+            y = (by1 + by2) // 2 - mh // 2
+            segs = 16
+            lit = int(round(m["level"] / 100 * segs))
+            bump = now - m.get("last_tick", -1e9) < 0.2
+            gap = max(1, mh // (segs * 5))
+            seg_h = (mh - gap * (segs - 1)) // segs
+            for i in range(segs):
+                sy2 = y + mh - i * (seg_h + gap)
+                on = i < lit
+                c = D.lerp_color(m["color"], WHITE, 0.5) if (on and bump and i == lit - 1) else \
+                    (m["color"] if on else (70, 55, 70))
+                cv2.rectangle(frame, (x, sy2 - seg_h), (x + mw + (px(3) if bump and i == lit - 1 else 0), sy2),
+                              c, -1)
+            arrow = "▲" if m["dir"] > 0 else "▼"
+            T.draw(frame, f"{arrow} {round(m['level'])}", (x + mw // 2, y - px(4) - T.measure("0", self.sz["small"], True)[1]),
+                   self.sz["small"], WHITE, bold=True, anchor="mt")
+
     def _mouse_box(self, frame, b):
         """Dashed active-area box: this part of the camera frame maps to the whole screen."""
         px = self.px
@@ -750,6 +937,23 @@ class UI:
 
 
 # ------------------------------------------------------------------ main loop
+class HandFx:
+    """Per-hand display state: smoothed box + tag position, colour fade, ring flash."""
+
+    def __init__(self):
+        self.box = D.RectSmoother(alpha=0.4)
+        self.tag = D.PointSmoother(alpha=0.35)
+        self.fade = D.ColorFade(duration=0.15)
+        self.flash_t = float("-inf")
+
+    def reset(self):
+        self.box.reset()
+        self.tag.reset()
+
+
+VOLUME_KEYS = {"media_volume_up": +1, "media_volume_down": -1}
+
+
 def run(args):
     cap = cv2.VideoCapture(args.video if args.video else args.camera)
     if not cap.isOpened():
@@ -779,6 +983,7 @@ def run(args):
                                  max_ratio=vol_cfg.get("max_ratio", 1.1),
                                  step=vol_cfg.get("step", 3), alpha=vol_cfg.get("alpha", 0.4))
     volume_modes = set(vol_cfg.get("modes", ["media"]))
+    pinch_ctl = motion.PinchController(slider)
     screen_w, screen_h = motion.screen_size()
     mouse_box = float(m_cfg.get("box", 0.6))
     mouse_logic = motion.MouseLogic(
@@ -800,6 +1005,11 @@ def run(args):
     pending = None      # 'p': landmarks waiting for the expected label
     prev = time.monotonic()
     fps = 0.0
+    hand_fx = [HandFx(), HandFx()]   # live gesture display, per hand slot
+    pops, floats = [], []             # big-emoji pops and floating action pills
+    recent_actions = deque(maxlen=3)  # chips under the HUD's confidence bar
+    meter, meter_dir = D.VolumeMeter(), +1
+    prev_stable = "unknown"
 
     print("Running... press q to quit (h legend, g debug, p save a test fixture).")
     try:
@@ -831,14 +1041,18 @@ def run(args):
             primary = hands[0] if hands else None  # first detected hand drives the controls
             raw, stable = "no hand", "unknown"
             mouse_events: list[tuple] = []
+            pinch = motion.PinchState()
             if primary:
                 lm, iso = primary.landmarks, primary.iso
                 raw = labels[0]  # straight from the classifier: swipe/pinch never change it
+                pinch = pinch_ctl.update(now, iso, infos[0].states, enabled=dispatcher.mode in volume_modes)
+                if pinch.ended:  # the L-shape voted "pointing" all along: don't let it fire on exit
+                    smoother.reset()
                 stable = smoother.update(raw)
             else:
                 smoother.reset()
                 swipe.reset()
-                slider.reset()
+                pinch_ctl.reset()
                 mouse_events += mouse_logic.reset()
 
             # ---- two hands, both open palm for `exit.hold` s -> quit
@@ -852,27 +1066,25 @@ def run(args):
             fired, fired_gesture = None, None
             dispatch_gesture = stable
             volume_level = pinch_pts = mouse_ui = None
-            pinching = False
+            pinching = pinch.active
+            if pinch.active:
+                volume_level = pinch.level
+                pinch_pts = [(int(lm[i][0] * fw), int(lm[i][1] * fh)) for i in (4, 8)]
+                if pinch.send is not None and not dispatcher.dry_run:  # DRY-RUN: only the bar moves
+                    motion.set_system_volume(pinch.send)
             if both_open:
                 dispatch_gesture = "unknown"
                 swipe.reset()
             elif primary:
                 states = infos[0].states
-                sw = swipe.update(now, motion.palm_center(lm), raw)
-                if sw:
-                    fired, fired_gesture = dispatcher.trigger(sw, now), sw
-                dispatch_gesture = swipe.gate(stable, now)  # no ✋ action while swiping
-
-                if dispatcher.mode in volume_modes and motion.is_pinch_pose(iso, states):
-                    pinching = True
-                    new_level = slider.update(motion.pinch_ratio(iso))
-                    if new_level is not None and not dispatcher.dry_run:
-                        motion.set_system_volume(new_level)
-                    volume_level = slider.level
-                    pinch_pts = [(int(lm[i][0] * fw), int(lm[i][1] * fh)) for i in (4, 8)]
-                    dispatch_gesture = "unknown"  # the L-shape would otherwise read as ☝️
+                if pinch.gating:  # pinch mode owns the hand: no static action, no swipe
+                    swipe.reset()
+                    dispatch_gesture = "unknown"
                 else:
-                    slider.reset()
+                    sw = swipe.update(now, motion.palm_center(lm), raw)
+                    if sw:
+                        fired, fired_gesture = dispatcher.trigger(sw, now), sw
+                    dispatch_gesture = swipe.gate(stable, now)  # no ✋ action while swiping
 
                 if dispatcher.mode == "mouse":
                     mf = mouse_logic.update(now, lm, iso=iso, states=states)
@@ -898,14 +1110,57 @@ def run(args):
             if toast and now - toast["t0"] > max(TOAST_SECONDS, PULSE_SECONDS):
                 toast = None
 
-            # ---- skeletons (tags are placed by the UI so they never cover a panel)
-            tags, debug_hands = [], []
+            # ---- live gesture display (display only: classification + actions are above)
+            fired_binding = dispatcher.bindings.get(fired_gesture) if fired else None
+            if fired:
+                hand_fx[0].flash_t = now  # ring flashes + pops when the action fires
+            views, debug_hands = [], []
+            shown = "pinch" if pinch.active else stable  # what the HUD / tag / legend display
+            new_confirm = shown not in ("unknown", "pinch") and shown != prev_stable and not pinch.gating
+            prev_stable = shown
             for i, hand in enumerate(hands):
-                pts = draw_hand(frame, hand, PINK, PURPLE, label=None, scale=ui.s)
-                g = stable if i == 0 else labels[i]
-                tags.append((hand_box(pts, fw, fh, ui.s),
-                             f"{ICONS.get(g, '')} {pretty(g)}" + ("" if i == 0 else "  (2nd)")))
+                fx = hand_fx[i]
+                if i == 0 and pinch.active:  # pinch mode: the ring shows the volume
+                    disp, prog, confirmed = "pinch", (pinch.level or 0) / 100, True
+                elif i == 0:  # hold-to-fire ring reads the smoother's votes (no logic change)
+                    disp, prog, confirmed = D.hold_progress(smoother.history, smoother.history.maxlen,
+                                                            smoother.min_ratio, stable)
+                else:
+                    disp, prog, confirmed = labels[i], None, labels[i] != "unknown"
+                fx.fade.set(D.gesture_color(disp), now)
+                col = fx.fade.value(now)
+                pts = draw_hand(frame, hand, PINK, PURPLE, scale=ui.s, glow_color=col,
+                                tips=infos[i].states, draw_box=False)
+                box = fx.box.update(hand_box(pts, fw, fh, ui.s))
+                views.append({"box": box, "color": col, "label": disp, "progress": prog,
+                              "confirmed": confirmed, "tag_smoother": fx.tag, "flash_t": fx.flash_t,
+                              "suffix": (f" · {pinch.level}%" if disp == "pinch" else "") if i == 0 else "  (2nd)"})
                 debug_hands.append((pts, infos[i].tri))
+            for i in range(len(hands), len(hand_fx)):
+                hand_fx[i].reset()
+            if new_confirm and views:
+                pops.append({"emoji": ICONS.get(stable, "✨"), "t0": now, "box": views[0]["box"]})
+            if fired:
+                chip = f"{D.action_icon(fired_binding)} {fired}"
+                recent_actions.appendleft(chip)
+                if views:
+                    floats.append({"text": chip, "color": D.gesture_color(fired_gesture), "t0": now,
+                                   "box": views[0]["box"]})
+                key0 = fired_binding.keys[0] if fired_binding and fired_binding.keys else None
+                if key0 in VOLUME_KEYS:
+                    meter_dir = VOLUME_KEYS[key0]
+                    meter.tick(meter_dir, now)
+            if volume_level is not None:
+                meter.set_level(volume_level)  # the pinch slider knows the real level
+            pops = [p for p in pops if now - p["t0"] < 0.8]
+            floats = [f for f in floats if now - f["t0"] < 1.0]
+            held = dispatcher.bindings.get(stable)
+            holding_volume = bool(held and held.repeat and held.keys and held.keys[0] in VOLUME_KEYS)
+            effects = {"pops": pops, "floats": floats}
+            if views and meter.visible(now, holding_volume):
+                effects["meter"] = {"box": views[0]["box"], "level": meter.level, "dir": meter_dir,
+                                    "color": D.gesture_color("thumbs_up" if meter_dir > 0 else "thumbs_down"),
+                                    "last_tick": meter.recent[-1] if meter.recent else float("-inf")}
 
             extra = [("both_palms", "✋✋ Both palms 1 s", "Quit", both_open)]
             if dispatcher.mode in volume_modes:
@@ -921,7 +1176,8 @@ def run(args):
             debug = None
             if show_debug:
                 if infos:
-                    lines = debug_lines(infos[0])
+                    lines = debug_lines(infos[0])  # raw label lives here, not in the HUD
+                    lines[0] += f"   ·   smoothed: {stable} ({smoother.confidence * 100:.0f}%)"
                     if ml:
                         lines[0] += f"   (ML: {labels[0]}, p={ml.last_confidence:.2f})"
                     if len(infos) > 1:
@@ -938,13 +1194,15 @@ def run(args):
 
             fps = 0.9 * fps + 0.1 * (1.0 / max(now - prev, 1e-6))
             prev = now
-            ui.render(frame, raw=raw, stable=stable, conf=smoother.confidence, fps=fps,
+            hud_override = ("🤏 Pinch", f"→  Volume {pinch.level}%") if pinch.active else None
+            ui.render(frame, raw=raw, stable=shown, conf=1.0 if pinch.active else smoother.confidence, fps=fps,
                       dry_run=dispatcher.dry_run, show_help=show_help,
                       hand_present=bool(hands), toast=toast, now=now,
                       bindings=dispatcher.bindings, mode=dispatcher.mode, extra_rows=extra,
                       volume=volume_level, pinch_pts=pinch_pts, mouse_ui=mouse_ui,
                       exit_progress=exit_progress, classifier=args.classifier.upper(),
-                      hand_tags=tags, debug=debug, prompt=prompt)
+                      debug=debug, prompt=prompt, hand_views=views, effects=effects,
+                      recent_actions=list(recent_actions), hud_override=hud_override)
 
             if args.record:
                 if writer is None:
@@ -973,6 +1231,8 @@ def run(args):
             if key == ord("m"):
                 vmouse.apply(mouse_logic.reset())  # release a held drag before leaving mouse mode
                 swipe.reset()
+                if pinch_ctl.reset():
+                    smoother.reset()
                 print(f"[mode] {dispatcher.cycle_mode()}")
             if key == ord("h"):
                 show_help = not show_help

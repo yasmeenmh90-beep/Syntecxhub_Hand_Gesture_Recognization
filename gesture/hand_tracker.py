@@ -138,14 +138,42 @@ def hand_box(pts, frame_w: int, frame_h: int, scale: float):
 
 
 GLOW_DOWNSCALE = 4  # the glow is blurred at 1/4 resolution: ~16x fewer pixels to blur
+SEGMENTS = 2  # gradient pieces per bone (2 looks as smooth as 3 at bone width, 1/3 fewer lines)
+_SEG_COLORS: dict = {}  # (color, color2) -> per-bone segment colours (constant, so cached)
+
+
+def _joint_color(color, color2, i):
+    key = (tuple(color), tuple(color2), i)
+    c = _SEG_COLORS.get(key)
+    if c is None:
+        c = _SEG_COLORS[key] = lerp_color(color, color2, _FINGER_T[i])
+    return c
+
+
+def _segment_colors(color, color2):
+    key = (tuple(color), tuple(color2))
+    cols = _SEG_COLORS.get(key)
+    if cols is None:
+        cols = []
+        for a, b in HAND_CONNECTIONS:
+            ta, tb = _FINGER_T[a], _FINGER_T[b]
+            cols.append([lerp_color(color, color2, ta + (tb - ta) * (k + 0.5) / SEGMENTS) for k in range(SEGMENTS)])
+        _SEG_COLORS[key] = cols
+    return cols
+
+
+TIP_FINGER = {4: "thumb", 8: "index", 12: "middle", 16: "ring", 20: "pinky"}
 
 
 def draw_hand(frame, hand: Hand, color=(216, 79, 255), color2=(246, 92, 139),
-              label: str | None = None, scale: float | None = None, text=None):
+              label: str | None = None, scale: float | None = None, text=None,
+              glow_color=None, tips: dict | None = None, draw_box: bool = True):
     """Draw a glowing pink->purple hand skeleton and a rounded box around it.
 
     `label` draws a gesture tag on the box (demo.py passes None and places the tag itself,
-    so it never covers a panel). `text` is an optional renderer with
+    so it never covers a panel). `glow_color` tints the soft glow (default: the bone
+    gradient). `tips` = {finger: extended} makes extended fingertips bigger and brighter
+    (with a halo) and curled ones smaller and dimmer. `draw_box=False` skips the box. `text` is an optional renderer with
     ``measure(text, size, bold)`` / ``draw(img, text, (x, y), size, color, bold=...)``;
     without it the tag uses OpenCV Hershey text. Returns the landmark pixel coordinates.
     """
@@ -154,16 +182,17 @@ def draw_hand(frame, hand: Hand, color=(216, 79, 255), color2=(246, 92, 139),
     pts = [(int(x * w), int(y * h)) for x, y, _ in hand.landmarks]
     bone = max(2, round(4 * s))
 
+    seg_cols = _segment_colors(color, color2)
+
     def bone_segments():
-        # split each bone into 3 pieces so the gradient looks continuous
-        for a, b in HAND_CONNECTIONS:
-            ta, tb = _FINGER_T[a], _FINGER_T[b]
+        # split each bone into SEGMENTS pieces so the gradient looks continuous
+        for (a, b), cols in zip(HAND_CONNECTIONS, seg_cols):
             (xa, ya), (xb, yb) = pts[a], pts[b]
-            for k in range(3):
-                u0, u1 = k / 3, (k + 1) / 3
+            for k in range(SEGMENTS):
+                u0, u1 = k / SEGMENTS, (k + 1) / SEGMENTS
                 p = (int(xa + (xb - xa) * u0), int(ya + (yb - ya) * u0))
                 q = (int(xa + (xb - xa) * u1), int(ya + (yb - ya) * u1))
-                yield p, q, lerp_color(color, color2, ta + (tb - ta) * (u0 + u1) / 2)
+                yield p, q, cols[k]
 
     # ---- soft glow: drawn + blurred on a downscaled copy of the hand's ROI only
     xs, ys = [p[0] for p in pts], [p[1] for p in pts]
@@ -175,9 +204,20 @@ def draw_hand(frame, hand: Hand, color=(216, 79, 255), color2=(246, 92, 139),
     if sw > 2 and sh > 2:
         small = np.zeros((sh, sw, 3), np.uint8)
         thick = max(1, round(bone * 4 / f))
-        for p, q, c in bone_segments():
-            cv2.line(small, ((p[0] - gx1) // f, (p[1] - gy1) // f), ((q[0] - gx1) // f, (q[1] - gy1) // f),
-                     c, thick, cv2.LINE_AA)
+        if glow_color is not None:  # one colour: whole bones in a single polylines call
+            segs = [np.array([((pts[a][0] - gx1) // f, (pts[a][1] - gy1) // f),
+                              ((pts[b][0] - gx1) // f, (pts[b][1] - gy1) // f)], np.int32)
+                    for a, b in HAND_CONNECTIONS]
+            cv2.polylines(small, segs, False, glow_color, thick, cv2.LINE_AA)
+        else:
+            for p, q, c in bone_segments():
+                cv2.line(small, ((p[0] - gx1) // f, (p[1] - gy1) // f), ((q[0] - gx1) // f, (q[1] - gy1) // f),
+                         c, thick, cv2.LINE_AA)
+        if tips:  # halo around the fingertips the classifier sees as extended
+            for i, finger in TIP_FINGER.items():
+                if tips.get(finger):
+                    cv2.circle(small, ((pts[i][0] - gx1) // f, (pts[i][1] - gy1) // f),
+                               max(2, round(16 * s / f)), (255, 255, 255), -1, cv2.LINE_AA)
         k = max(3, int(21 * s / f)) | 1
         small = cv2.GaussianBlur(small, (k, k), 0)
         roi = frame[gy1:gy1 + sh * f, gx1:gx1 + sw * f]
@@ -190,18 +230,25 @@ def draw_hand(frame, hand: Hand, color=(216, 79, 255), color2=(246, 92, 139),
 
     # ---- joints: small dots; fingertips bigger with a white outline
     for i, p in enumerate(pts):
-        c = lerp_color(color, color2, _FINGER_T[i])
+        c = seg_cols[0][0] if i == 0 else _joint_color(color, color2, i)
         if i in FINGERTIPS:
-            r = max(4, round(9 * s))
-            cv2.circle(frame, p, r + max(1, round(2 * s)), (255, 255, 255), -1, cv2.LINE_AA)
-            cv2.circle(frame, p, r, c, -1, cv2.LINE_AA)
+            extended = True if tips is None else bool(tips.get(TIP_FINGER[i]))
+            if extended:
+                r = max(4, round((11 if tips else 9) * s))
+                cv2.circle(frame, p, r + max(1, round((2.5 if tips else 2) * s)), (255, 255, 255), -1, cv2.LINE_AA)
+                cv2.circle(frame, p, r, lerp_color(c, (255, 255, 255), 0.25) if tips else c, -1, cv2.LINE_AA)
+            else:  # curled: small and dim
+                r = max(3, round(5 * s))
+                cv2.circle(frame, p, r + 1, (60, 45, 60), -1, cv2.LINE_AA)
+                cv2.circle(frame, p, r, lerp_color(c, (110, 95, 110), 0.6), -1, cv2.LINE_AA)
         else:
             cv2.circle(frame, p, max(2, round(4 * s)), c, -1, cv2.LINE_AA)
 
     # ---- rounded bounding box (+ optional tag)
     bx1, by1, bx2, by2 = hand_box(pts, w, h, s)
-    rounded_rect(frame, (bx1, by1), (bx2, by2), int(18 * s), color, max(1, round(2 * s)))
-    if label:
+    if draw_box:
+        rounded_rect(frame, (bx1, by1), (bx2, by2), int(18 * s), color, max(1, round(2 * s)))
+    if label and draw_box:
         size = max(12, round(18 * s))
         if text is not None:
             tw, th = text.measure(label, size, True)

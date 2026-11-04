@@ -51,6 +51,25 @@ The angle is what makes sideways hands work. A finger pointing sideways is still
 - **Fist safety:** ✊ needs all four fingers *clearly* curled, so an unclear hand never fires Mute.
 - **Aspect ratio:** MediaPipe normalises x by the frame *width* and y by its *height*. Classification therefore uses `Hand.iso`, with x and z scaled by width/height, so angles and distances are true to the image.
 
+### What you see on your hand
+
+Each gesture has its own accent colour, used by the skeleton glow, the hand box and the tag. It fades over 150 ms when the gesture changes:
+
+| ✋ palm | ✊ fist | 👍 up | 👎 down | ✌️ peace | ☝️ pointing | 🤟 rock | 👌 ok | 🤙 call me |
+|---|---|---|---|---|---|---|---|---|
+| pink | red | green | orange | cyan | purple | magenta | yellow | teal |
+
+- **Hold-to-fire ring** around the emoji on the hand tag. It fills as the smoother collects votes for the gesture, and reaches 100% exactly when the gesture is confirmed. It flashes and pops when the action fires, so you can see when something is about to happen.
+- **Big emoji pop** (~120 px) above the hand when a *new* gesture is confirmed. It scales 0.6 → 1.1 → 1.0 and fades out over 0.8 s.
+- **Finger highlights:** fingertips the classifier sees as extended are bigger and brighter with a halo. Curled ones are small and dim.
+- **Smooth tag and box:** both follow the hand with an EMA instead of jumping. They stay inside the frame and never draw over the HUD, legend or other panels.
+- **Action pill** (e.g. `⏭ Next track`) floats up from the hand when an action fires, in addition to the centre toast.
+- **Volume meter** next to the hand while 👍/👎 is held. It ticks one step per repeat. The level is an estimate, because the system volume isn't read back; the pinch slider resets it to the real value.
+- **Unknown pose:** a dashed grey box and a muted `…` tag instead of "🤔 Unknown".
+- **HUD:** shows the gesture, its action, the confidence bar and the **last 3 fired actions** as chips. The raw per-frame label is only in the `g` debug card.
+
+All of this is drawn from cached cards and emoji sprites, with no font loading per frame. That's about 2 ms per frame at 1080p for one hand, and about 3 ms for two hands with every effect active.
+
 ### Debugging a pose: `g` and `p`
 
 - **`g`** toggles a debug card that shows:
@@ -78,6 +97,12 @@ The file starts with five real hands taken from MediaPipe's sample photos (landm
 
 How the controls avoid clashing:
 - **Swipe vs ✋ Play/Pause:** the static open-palm action only fires once the palm has been still for 0.3 s (`swipe.still_hold`). After a swipe it is blocked until the pose changes, so a swipe never also toggles playback.
+- **Pinch mode owns the hand.** While it's active:
+  - the HUD and hand tag show **🤏 Pinch → Volume N%**, and the tag's ring shows the level
+  - every static action and swipe is blocked; the L-shape classifies as ☝️ but can't fire Previous track
+  - only the volume bar changes in DRY-RUN
+
+  Mode starts after 2 pinch frames, though actions are blocked from the first one. It survives brief misreads for 0.3 s. When it ends, the smoother is cleared, so the pinch's leftover "pointing" can't fire on exit. A real ☝️ afterwards just needs its normal hold.
 - **Pinch slider vs ☝️ Pointing:** the slider needs the thumb out, or near the index tip. Pointing with the thumb tucked is still "previous track". In media mode the L-shape (thumb + index out) is the volume slider.
 - **Click vs 👌 / ✊:** a pinch with middle, ring and pinky all up is 👌 (screenshot), not a click. A fist doesn't count either: the index tip must reach more than one palm size from the wrist.
 - **While both palms are open** for the exit gesture, no other actions fire.
@@ -311,9 +336,20 @@ python tools/make_gif.py demo.mp4 --start 2 --duration 12   # trim
 python -m pytest -q
 ```
 
-152 tests, mostly on synthetic landmarks, trajectories and video, so they need no webcam, model, mouse or speakers. They cover:
+177 tests, mostly on synthetic landmarks, trajectories and video, so they need no webcam, model, mouse or speakers. They cover:
 - every gesture, including rock, OK and call me, on both hands and at ±25° rotation
 - the look-alike pairs (rock / call me / pointing, OK / open palm), and 🤘 horns as rock
+- the live display helpers (`tests/test_display.py`):
+  - the gesture colour map and the 150 ms fade
+  - hold-ring progress, checked against the real smoother: it reaches 100% exactly when the gesture is confirmed
+  - box/tag EMA smoothing and jitter reduction
+  - tag placement that stays in the frame and avoids panels
+  - the pop/float/flash curves, action icons and the volume meter
+- pinch mode (`tests/test_pinch_mode.py`):
+  - pointing (and every other action) never fires while pinch mode is active, nor on the frame it ends
+  - the volume goes 100% (wide) → 0% (touching) smoothly, and the OS is only told about changes of 3 or more
+  - the pinch pose holds across the whole gap on both hands
+  - one-frame debounce, the 0.3 s exit grace, and pinch being off outside volume modes
 - guided collection (`tests/test_guided.py`):
   - the gesture order and hints, and a full 10-gesture run
   - the 3-2-1 countdown
@@ -367,6 +403,7 @@ evaluate.py              rules vs RandomForest vs MLP -> reports/comparison.md
 gesture/hand_tracker.py  MediaPipe landmark detection + drawing
 gesture/classifier.py    rule-based static poses: finger tri-state, hysteresis (PoseTracker), explain(), smoother
 gesture/debug.py         debug-card text + the real-hand fixture file
+gesture/display.py       live overlay helpers: gesture colours, hold ring, smoothing, animation curves
 gesture/guided.py        guided collection logic (order, countdown, rate limit, skip / redo / pause)
 gesture/features.py      shared landmark normalisation + CSV format
 gesture/ml.py            dataset loading, leak-free split, runtime ML classifier
@@ -377,6 +414,8 @@ config.yaml              gesture → action mappings per mode, cooldowns, thresh
 tests/test_gestures.py   static gestures, config, modes, actions
 tests/test_motion.py     swipes, volume mapping, mouse mapping/smoothing, exit hold
 tests/test_classifier_v2.py  live-testing regressions (thumb, sideways, hysteresis, horns)
+tests/test_pinch_mode.py pinch mode gating, volume mapping, debounce / exit grace
+tests/test_display.py    colour mapping, hold-ring progress, tag smoothing
 tests/test_guided.py     guided collection: order, skip, redo, pause, rate limit
 tests/test_real_hands.py real-hand fixtures (tests/fixtures/real_hands.json)
 tests/test_ml.py         feature invariance, train/evaluate on synthetic CSV, ML inference
